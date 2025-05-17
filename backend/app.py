@@ -1,137 +1,151 @@
 import os
-from flask import Flask, render_template, jsonify, request
+import pathlib
+from flask import Flask, request, jsonify
 from flask_cors import CORS
-from src.components.preprocess import hf_embeds
-from langchain_pinecone import PineconeVectorStore
-from langchain_google_genai import ChatGoogleGenerativeAI, HarmBlockThreshold, HarmCategory
-from langchain.chains import create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain.prompts import ChatPromptTemplate
-from src.utils.prompts import *
-from huggingface_hub import login
-
-##import pickle
-#import numpy as np
-
-
+from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 
+# LangChain imports
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+
+from langchain_community.vectorstores import FAISS
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.prompts import ChatPromptTemplate
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain.chains import create_retrieval_chain
+
+# Load environment variables
 load_dotenv()
 
-app = Flask(__name__, static_folder="static")
+app = Flask(__name__)
 CORS(app)
 
-PINECONE_API_KEY = os.getenv('PINECONE_DB_KEY')
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-SYSTEM_PROMPT = os.getenv('SYSTEM_PROMPT')
-HF_TOKEN = os.getenv('HF_TOKEN')
 
-os.environ["PINECONE_API_KEY"] = PINECONE_API_KEY
-os.environ["GEMINI_API_KEY"] = GEMINI_API_KEY
-os.environ["SYSTEM_PROMPT"] = SYSTEM_PROMPT
 
-if HF_TOKEN:
-    login(HF_TOKEN)
-else:
-    print("HF_TOKEN is missing! Check your .env file.")
+UPLOAD_FOLDER = "uploaded_docs"
+INDEX_FOLDER = "faiss_indexes"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(INDEX_FOLDER, exist_ok=True)
 
-login(HF_TOKEN)
+SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT")
+HF_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-embeds = hf_embeds()
+if not SYSTEM_PROMPT:
+    raise ValueError("SYSTEM_PROMPT is not set in the .env file.")
 
-index_name = "arogyam"
-doc_search = PineconeVectorStore.from_existing_index(
-    index_name=index_name,
-    embedding=embeds
+if not HF_TOKEN:
+    raise ValueError("HUGGINGFACEHUB_API_TOKEN is not set in the .env file.")
+
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY is not set in the .env file.")
+
+# Initialize HuggingFace embeddings
+embeddings = HuggingFaceEmbeddings(
+    model_name='sentence-transformers/all-mpnet-base-v2'
 )
 
-retriever = doc_search.as_retriever(search_type="similarity", search_kwargs={"k": 5})
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.0-flash", 
-    google_api_key=GEMINI_API_KEY,
-    temperature=0.2,
-    max_tokens=1000,   
-    safety_settings={
-        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE
-    },
-)
+# Initialize Gemini LLM (Google Generative AI)
+llm = ChatGoogleGenerativeAI(model="models/chat-bison-001", google_api_key=GEMINI_API_KEY)
 
-prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", system_prompt),
-        ("human", "{input}")
-    ]
-)
 
-qa_chain = create_stuff_documents_chain(llm, prompt)
-rag_chain = create_retrieval_chain(retriever, qa_chain)
+def pdf_loader(pdf_path):
+    loader = PyPDFLoader(pdf_path)
+    docs = loader.load()
+    if not docs:
+        raise ValueError("No content found in PDF")
+    return docs
+
+def text_chunking(docs):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=20)
+    return splitter.split_documents(docs)
 
 @app.route("/")
-def index():
-    return render_template("chat.html")
+def home():
+    return "Welcome to the Medical Chatbot backend. Use /upload to upload PDFs and /query to ask questions."
 
-@app.route("/get", methods=["GET", "POST"])
-def medic_chat():
+@app.route("/upload", methods=["POST"])
+def upload_file():
+    if 'file' not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+
+    file = request.files['file']
+    filename = secure_filename(file.filename)
+    if filename == "":
+        return jsonify({"error": "Empty filename"}), 400
+
+    save_path = os.path.join(UPLOAD_FOLDER, filename)
+    file.save(save_path)
+
     try:
-        data = request.json
-        print("Received Data:", data)  # Debugging
-        message = data.get("msg", "")
-        language = data.get("language", "en")
-        if not message:
-            return jsonify({"error": "Message is required"}), 400
-        
-        print(f"Processing input: {message} (Language: {language})")
-        response = rag_chain.invoke({"input": message, "language": language})
-        print("Response:", response["answer"])
-        return jsonify({"response": response["answer"]})
+        docs = pdf_loader(save_path)
+        chunks = text_chunking(docs)
+
+        faiss_index = FAISS.from_documents(chunks, embeddings)
+        index_name = pathlib.Path(filename).stem
+        index_path = os.path.join(INDEX_FOLDER, index_name)
+        os.makedirs(index_path, exist_ok=True)
+        faiss_index.save_local(index_path)
+
+        return jsonify({
+            "message": "Upload and indexing successful.",
+            "filename": filename
+        }), 200
+
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": f"Error processing PDF: {str(e)}"}), 500
 
-##Breast Cancer model code start
-#Load the trained model
-#with open("breast_cancer_model.pkl", "rb") as model_file:
-    #model = pickle.load(model_file)
+@app.route("/query", methods=["POST"])
+def query_uploaded():
+    data = request.get_json()
+    question = data.get("question", "").strip()
+    filename = data.get("filename", "").strip()
 
-#@app.route("/breastpredict", methods=["POST"])
-#def predict():
-    # try:
-    #     data = request.json["features"]  # Expecting a list of numerical values
-    #     input_features = np.array(data).reshape(1, -1)  # Convert to NumPy array
-    #     prediction = model.predict(input_features)
-    #     result = int(prediction[0])  # Convert NumPy int to Python int
-    #     return jsonify({"prediction": result})
-    # except Exception as e:
-    #     return jsonify({"error": str(e)})
+    if not question:
+        return jsonify({"error": "Question is required"}), 400
+    if not filename:
+        return jsonify({"error": "Filename is required"}), 400
 
-##breast cancer model code end
+    index_name = pathlib.Path(filename).stem
+    index_path = os.path.join(INDEX_FOLDER, index_name)
 
-##Load the trained PCOD model
-# model_path = "pcod_model.pkl"  # Update with your actual path if different
-# with open(model_path, "rb") as model_file:
-#     model = pickle.load(model_file)
+    if not os.path.exists(index_path):
+        return jsonify({"error": "No document found. Please upload it first."}), 400
 
-# @app.route("/")
-# def home():
-#     return jsonify({"message": "PCOD Prediction API is running"})
+    try:
+        faiss_index = FAISS.load_local(index_path, embeddings, allow_dangerous_deserialization=True)
+        retriever = faiss_index.as_retriever(search_type="similarity", search_kwargs={"k": 5})
 
-# # API endpoint for prediction
-# @app.route("/pcodpredict", methods=["POST"])
-# def predict():
-#     try:
-#         data = request.get_json()  # Get JSON data from frontend
-#         features = np.array(data["features"]).reshape(1, -1)  # Convert to numpy array
-        
-#         prediction = model.predict(features)  # Make prediction
-#         result = "PCOD Detected" if prediction[0] == 1 else "No PCOD Detected"
-        
-#         return jsonify({"prediction": result})
+        prompt_template = (
+            SYSTEM_PROMPT + "\n\n"
+            "Use the following CONTEXT to answer the question. "
+            "If the answer is not in the context, say 'I don't know.'\n\n"
+            "CONTEXT:\n{context}\n\n"
+            "Question: {input}\n"
+            "Answer:"
+        )
+        prompt = ChatPromptTemplate.from_template(prompt_template)
 
-#     except Exception as e:
-#         return jsonify({"error": str(e)})
-    
-    ##Pcod end
+        qa_chain = create_stuff_documents_chain(
+            llm=llm,
+            prompt=prompt,
+            document_variable_name="context"
+        )
+        rag_chain = create_retrieval_chain(
+            retriever=retriever,
+            combine_docs_chain=qa_chain
+        )
 
+        result = rag_chain.invoke({"input": question})
 
-if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=8080, debug=True)
+        answer = result.get("output", "")  # sometimes the key is "output"
+
+        return jsonify({"answer": answer})
+
+    except Exception as e:
+        return jsonify({"error": f"Error during query: {str(e)}"}), 500
+
+if __name__ == "__main__":
+    app.run(debug=True, port=8082)
